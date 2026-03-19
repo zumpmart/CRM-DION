@@ -254,89 +254,143 @@ export default function App() {
     }
   };
 
+  const [syncError, setSyncError] = useState<string | null>(null);
+
   useEffect(() => {
     if (!currentUser) return;
 
     const isAdminOrManager = currentUser.role === UserRole.ADMIN || currentUser.role === UserRole.SUPERVISOR || currentUser.role === UserRole.GERENTE;
     
-    let salesQ;
-    let receiptsQ;
-
-    if (isAdminOrManager) {
-      salesQ = query(collection(db, 'sales'), orderBy('created_at', 'desc'));
-      receiptsQ = query(collection(db, 'receipts'), orderBy('created_at', 'desc'));
-    } else {
-      // For Vendedor, fetch only their sales or sales transferred to them
-      salesQ = query(
-        collection(db, 'sales'), 
-        or(
-          where('vendedor_id', '==', currentUser.id),
-          where('transfer_to', '==', currentUser.id)
-        ),
-        orderBy('created_at', 'desc')
-      );
-      receiptsQ = query(
-        collection(db, 'receipts'), 
-        where('vendedor_id', '==', currentUser.id),
-        orderBy('created_at', 'desc')
-      );
-    }
-
-    const unsubSales = onSnapshot(salesQ, (snapshot) => {
-      const salesData = snapshot.docs.map(doc => ({ ...(doc.data() as Sale), id: doc.id }))
-        .sort((a, b) => {
-          const timeA = new Date(a.created_at).getTime() || 0;
-          const timeB = new Date(b.created_at).getTime() || 0;
-          if (timeB !== timeA) return timeB - timeA;
-          const updatedA = new Date(a.updated_at || a.created_at).getTime() || 0;
-          const updatedB = new Date(b.updated_at || b.created_at).getTime() || 0;
-          if (updatedB !== updatedA) return updatedB - updatedA;
-          return b.id.localeCompare(a.id);
-        });
-      setSales(salesData);
-    }, (error) => {
-      console.error("Erro ao buscar vendas:", error);
-    });
-
-    const unsubReceipts = onSnapshot(receiptsQ, (snapshot) => {
-      const receiptsData = snapshot.docs.map(doc => ({ ...(doc.data() as Receipt), id: doc.id }))
-        .sort((a, b) => {
-          const timeA = new Date(a.created_at).getTime() || 0;
-          const timeB = new Date(b.created_at).getTime() || 0;
-          if (timeB !== timeA) return timeB - timeA;
-          return b.id.localeCompare(a.id);
-        });
-      setReceipts(receiptsData);
-    }, (error) => {
-      console.error("Erro ao buscar comprovantes:", error);
-    });
-
+    let unsubSales: any;
+    let unsubSalesTransferred: any;
+    let unsubRankingSales: any;
+    let unsubReceipts: any;
     let unsubProfiles: any;
     let unsubLogs: any;
     let unsubPayments: any;
 
+    setSyncError(null);
+
+    const handleSyncError = (error: any, context: string) => {
+      console.error(`Erro de sincronização (${context}):`, error);
+      setSyncError(`Falha na sincronização de dados (${context}). Por favor, recarregue a página.`);
+    };
+
+    const sortSales = (salesList: Sale[]) => {
+      return salesList.sort((a, b) => {
+        const timeA = new Date(a.created_at).getTime() || 0;
+        const timeB = new Date(b.created_at).getTime() || 0;
+        if (timeB !== timeA) return timeB - timeA;
+        const updatedA = new Date(a.updated_at || a.created_at).getTime() || 0;
+        const updatedB = new Date(b.updated_at || b.created_at).getTime() || 0;
+        if (updatedB !== updatedA) return updatedB - updatedA;
+        return b.id.localeCompare(a.id);
+      });
+    };
+
+    if (isAdminOrManager) {
+      const salesQ = query(collection(db, 'sales'), orderBy('created_at', 'desc'));
+      const receiptsQ = query(collection(db, 'receipts'), orderBy('created_at', 'desc'));
+      
+      unsubSales = onSnapshot(salesQ, (snapshot) => {
+        const salesData = snapshot.docs.map(doc => ({ ...(doc.data() as Sale), id: doc.id }));
+        setSales(sortSales(salesData));
+      }, (error) => handleSyncError(error, 'Vendas'));
+
+      unsubReceipts = onSnapshot(receiptsQ, (snapshot) => {
+        const receiptsData = snapshot.docs.map(doc => ({ ...(doc.data() as Receipt), id: doc.id }))
+          .sort((a, b) => {
+            const timeA = new Date(a.created_at).getTime() || 0;
+            const timeB = new Date(b.created_at).getTime() || 0;
+            if (timeB !== timeA) return timeB - timeA;
+            return b.id.localeCompare(a.id);
+          });
+        setReceipts(receiptsData);
+      }, (error) => handleSyncError(error, 'Comprovantes'));
+    } else {
+      // For Vendedor, fetch only their sales or sales transferred to them using separate queries
+      const salesQ1 = query(collection(db, 'sales'), where('vendedor_id', '==', currentUser.id));
+      const salesQ2 = query(collection(db, 'sales'), where('transfer_to', '==', currentUser.id));
+      const salesQ3 = query(collection(db, 'sales'), where('status', '==', SaleStatus.PAGO));
+      
+      let mySales: Sale[] = [];
+      let transferredSales: Sale[] = [];
+      let rankingSales: Sale[] = [];
+
+      const mergeSales = () => {
+        const merged = [...mySales, ...transferredSales, ...rankingSales];
+        const uniqueSalesMap = new Map<string, Sale>();
+        
+        merged.forEach(item => {
+          if (!uniqueSalesMap.has(item.id)) {
+            uniqueSalesMap.set(item.id, item);
+          } else {
+            const existing = uniqueSalesMap.get(item.id)!;
+            const existingTime = new Date(existing.updated_at || existing.created_at).getTime() || 0;
+            const newTime = new Date(item.updated_at || item.created_at).getTime() || 0;
+            if (newTime > existingTime) {
+              uniqueSalesMap.set(item.id, item);
+            }
+          }
+        });
+        
+        setSales(sortSales(Array.from(uniqueSalesMap.values())));
+      };
+
+      unsubSales = onSnapshot(salesQ1, (snapshot) => {
+        mySales = snapshot.docs.map(doc => ({ ...(doc.data() as Sale), id: doc.id }));
+        mergeSales();
+      }, (error) => handleSyncError(error, 'Minhas Vendas'));
+
+      unsubSalesTransferred = onSnapshot(salesQ2, (snapshot) => {
+        transferredSales = snapshot.docs.map(doc => ({ ...(doc.data() as Sale), id: doc.id }));
+        mergeSales();
+      }, (error) => handleSyncError(error, 'Vendas Transferidas'));
+
+      unsubRankingSales = onSnapshot(salesQ3, (snapshot) => {
+        rankingSales = snapshot.docs.map(doc => ({ ...(doc.data() as Sale), id: doc.id }));
+        mergeSales();
+      }, (error) => handleSyncError(error, 'Ranking'));
+
+      const receiptsQ = query(collection(db, 'receipts'), where('vendedor_id', '==', currentUser.id));
+      unsubReceipts = onSnapshot(receiptsQ, (snapshot) => {
+        const receiptsData = snapshot.docs.map(doc => ({ ...(doc.data() as Receipt), id: doc.id }))
+          .sort((a, b) => {
+            const timeA = new Date(a.created_at).getTime() || 0;
+            const timeB = new Date(b.created_at).getTime() || 0;
+            if (timeB !== timeA) return timeB - timeA;
+            return b.id.localeCompare(a.id);
+          });
+        setReceipts(receiptsData);
+      }, (error) => handleSyncError(error, 'Meus Comprovantes'));
+    }
+
     if (currentUser.role === UserRole.ADMIN || currentUser.role === UserRole.GERENTE) {
       unsubProfiles = onSnapshot(collection(db, 'profiles'), (snapshot) => {
         setUsers(snapshot.docs.map(doc => ({ ...(doc.data() as UserProfile), id: doc.id })));
-      });
+      }, (error) => handleSyncError(error, 'Perfis'));
       unsubLogs = onSnapshot(query(collection(db, 'audit_logs'), orderBy('created_at', 'desc'), limit(100)), (snapshot) => {
         setLogs(snapshot.docs.map(doc => ({ ...(doc.data() as AuditLog), id: doc.id })));
-      });
+      }, (error) => handleSyncError(error, 'Logs'));
       unsubPayments = onSnapshot(query(collection(db, 'payments'), orderBy('created_at', 'desc')), (snapshot) => {
         setPayments(snapshot.docs.map(doc => ({ ...(doc.data() as Payment), id: doc.id })));
-      });
+      }, (error) => handleSyncError(error, 'Pagamentos'));
     } else {
       unsubProfiles = onSnapshot(collection(db, 'profiles'), (snapshot) => {
         setUsers(snapshot.docs.map(doc => ({ ...(doc.data() as UserProfile), id: doc.id })));
-      });
-      unsubPayments = onSnapshot(query(collection(db, 'payments'), where('vendedor_id', '==', currentUser.id), orderBy('created_at', 'desc')), (snapshot) => {
-        setPayments(snapshot.docs.map(doc => ({ ...(doc.data() as Payment), id: doc.id })));
-      });
+      }, (error) => handleSyncError(error, 'Perfis'));
+      unsubPayments = onSnapshot(query(collection(db, 'payments'), where('vendedor_id', '==', currentUser.id)), (snapshot) => {
+        const paymentsData = snapshot.docs.map(doc => ({ ...(doc.data() as Payment), id: doc.id }));
+        paymentsData.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+        setPayments(paymentsData);
+      }, (error) => handleSyncError(error, 'Meus Pagamentos'));
     }
 
     return () => {
-      unsubSales();
-      unsubReceipts();
+      if (unsubSales) unsubSales();
+      if (unsubSalesTransferred) unsubSalesTransferred();
+      if (unsubRankingSales) unsubRankingSales();
+      if (unsubReceipts) unsubReceipts();
       if (unsubProfiles) unsubProfiles();
       if (unsubLogs) unsubLogs();
       if (unsubPayments) unsubPayments();
@@ -344,59 +398,9 @@ export default function App() {
   }, [currentUser]);
 
   // --- Background Cleanup Routine ---
+  // TODO: Implement server-side job for data retention and cleanup
   useEffect(() => {
-    if (!currentUser || (currentUser.role !== UserRole.ADMIN && currentUser.role !== UserRole.GERENTE)) return;
-
-    const runCleanup = async () => {
-      try {
-        const now = new Date();
-        const oneDayAgo = new Date(now.getTime() - 24 * 60 * 60 * 1000).toISOString();
-        const thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000).toISOString();
-
-        // 1. Cleanup Sales Receipts (older than 24h since sale was PAGO)
-        const paidSalesQuery = query(collection(db, 'sales'), where('status', '==', SaleStatus.PAGO), where('paid_at', '<', oneDayAgo));
-        const paidSalesSnapshot = await getDocs(paidSalesQuery);
-        const oldPaidSaleIds = paidSalesSnapshot.docs.map(d => d.id);
-
-        if (oldPaidSaleIds.length > 0) {
-          const receiptsSnapshot = await getDocs(collection(db, 'receipts'));
-          const receiptsToDelete = receiptsSnapshot.docs.filter(d => oldPaidSaleIds.includes(d.data().sale_id));
-
-          for (const receiptDoc of receiptsToDelete) {
-            await deleteDoc(doc(db, 'receipts', receiptDoc.id));
-          }
-        }
-
-        // 2. Cleanup Audit Logs (older than 30 days)
-        const oldLogsQuery = query(collection(db, 'audit_logs'), where('created_at', '<', thirtyDaysAgo));
-        const oldLogsSnapshot = await getDocs(oldLogsQuery);
-        for (const logDoc of oldLogsSnapshot.docs) {
-          await deleteDoc(doc(db, 'audit_logs', logDoc.id));
-        }
-
-        // 3. Cleanup Commission Payments (older than 30 days)
-        const oldPaymentsQuery = query(collection(db, 'payments'), where('created_at', '<', thirtyDaysAgo));
-        const oldPaymentsSnapshot = await getDocs(oldPaymentsQuery);
-        for (const paymentDoc of oldPaymentsSnapshot.docs) {
-          const data = paymentDoc.data() as Payment;
-          if (data.receipt_url) {
-            try {
-              const fileRef = ref(storage, data.receipt_url);
-              await deleteObject(fileRef);
-            } catch (e) {
-              console.error("Erro ao excluir arquivo do comprovante de pagamento:", e);
-            }
-          }
-          await deleteDoc(doc(db, 'payments', paymentDoc.id));
-        }
-
-      } catch (error) {
-        console.error("Erro ao executar limpeza em segundo plano:", error);
-      }
-    };
-
-    // Run cleanup once when admin logs in
-    runCleanup();
+    // Cleanup removed from frontend to prevent destructive actions
   }, [currentUser]);
 
   const [isLoggingIn, setIsLoggingIn] = useState(false);
@@ -1174,47 +1178,16 @@ export default function App() {
         return;
       }
 
-      // Compress image to base64
-      const base64 = await new Promise<string>((resolve, reject) => {
-        const reader = new FileReader();
-        reader.readAsDataURL(file);
-        reader.onload = (event) => {
-          const img = new Image();
-          img.src = event.target?.result as string;
-          img.onload = () => {
-            const canvas = document.createElement('canvas');
-            const MAX_WIDTH = 800;
-            const MAX_HEIGHT = 800;
-            let width = img.width;
-            let height = img.height;
-
-            if (width > height) {
-              if (width > MAX_WIDTH) {
-                height *= MAX_WIDTH / width;
-                width = MAX_WIDTH;
-              }
-            } else {
-              if (height > MAX_HEIGHT) {
-                width *= MAX_HEIGHT / height;
-                height = MAX_HEIGHT;
-              }
-            }
-            canvas.width = width;
-            canvas.height = height;
-            const ctx = canvas.getContext('2d');
-            ctx?.drawImage(img, 0, 0, width, height);
-            resolve(canvas.toDataURL('image/jpeg', 0.7));
-          };
-          img.onerror = error => reject(error);
-        };
-        reader.onerror = error => reject(error);
-      });
+      // Upload to Firebase Storage
+      const storageRef = ref(storage, `receipts/${saleId}_${Date.now()}_${file.name}`);
+      await uploadBytes(storageRef, file);
+      const downloadURL = await getDownloadURL(storageRef);
 
       const receiptRef = await addDoc(collection(db, 'receipts'), {
         sale_id: saleId,
         vendedor_id: currentUser.id,
         file_name: file.name,
-        file_path: base64, // Storing base64 directly
+        file_path: downloadURL, // Storing the URL instead of base64
         status: ReceiptStatus.ENVIADO,
         value: sale.value || 0,
         created_at: new Date().toISOString()
@@ -1228,10 +1201,13 @@ export default function App() {
     }
   };
 
-  const handleViewReceipt = (base64Data: string) => {
+  const handleViewReceipt = (filePath: string) => {
     try {
-      if (base64Data.startsWith('data:')) {
-        const arr = base64Data.split(',');
+      if (filePath.startsWith('http')) {
+        window.open(filePath, '_blank');
+      } else if (filePath.startsWith('data:')) {
+        // Fallback for old base64 receipts
+        const arr = filePath.split(',');
         const mime = arr[0].match(/:(.*?);/)?.[1] || 'image/jpeg';
         const bstr = atob(arr[1]);
         let n = bstr.length;
@@ -1243,12 +1219,12 @@ export default function App() {
         const url = URL.createObjectURL(blob);
         window.open(url, '_blank');
       } else {
-        window.open(base64Data, '_blank');
+        window.open(filePath, '_blank');
       }
     } catch (e) {
       console.error(e);
       const win = window.open();
-      if (win) win.document.write(`<img src="${base64Data}" style="max-width: 100%;" />`);
+      if (win) win.document.write(`<img src="${filePath}" style="max-width: 100%;" />`);
     }
   };
 
@@ -1467,6 +1443,22 @@ export default function App() {
             <h2 className="text-lg font-bold text-zinc-900 capitalize">{currentPage.replace('-', ' ')}</h2>
           </div>
         </header>
+
+        {/* Sync Error Banner */}
+        {syncError && (
+          <div className="bg-red-50 border-l-4 border-red-500 p-4 m-4 rounded-md shadow-sm">
+            <div className="flex">
+              <div className="flex-shrink-0">
+                <AlertCircle className="h-5 w-5 text-red-400" />
+              </div>
+              <div className="ml-3">
+                <p className="text-sm text-red-700 font-medium">
+                  {syncError}
+                </p>
+              </div>
+            </div>
+          </div>
+        )}
 
         {/* Page Content */}
         <div className="flex-1 overflow-y-auto p-8">
